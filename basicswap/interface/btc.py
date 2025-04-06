@@ -18,15 +18,9 @@ from basicswap.basicswap_util import (
     getVoutByAddress,
     getVoutByScriptPubKey,
 )
-from basicswap.contrib.test_framework import (
-    segwit_addr,
-)
-from basicswap.interface.base import (
-    Secp256k1Interface,
-)
+from basicswap.interface.base import Secp256k1Interface
 from basicswap.util import (
     ensure,
-    b2h,
     i2b,
     b2i,
     i2h,
@@ -35,6 +29,7 @@ from basicswap.util.ecc import (
     pointToCPK,
     CPKToPoint,
 )
+from basicswap.util.extkey import ExtKeyPair
 from basicswap.util.script import (
     decodeScriptNum,
     getCompactSizeLen,
@@ -44,6 +39,7 @@ from basicswap.util.script import (
 from basicswap.util.address import (
     toWIF,
     b58encode,
+    b58decode,
     decodeWif,
     decodeAddress,
     pubkeyToAddress,
@@ -63,6 +59,8 @@ from coincurve.ecdsaotves import (
     ecdsaotves_rec_enc_key,
 )
 
+from basicswap.contrib.test_framework import segwit_addr
+from basicswap.contrib.test_framework.descriptors import descsum_create
 from basicswap.contrib.test_framework.messages import (
     COIN,
     COutPoint,
@@ -267,9 +265,21 @@ class BTCInterface(Secp256k1Interface):
         self._rpcauth = coin_settings["rpcauth"]
         self.rpc = make_rpc_func(self._rpcport, self._rpcauth, host=self._rpc_host)
         self._rpc_wallet = coin_settings.get("wallet_name", "wallet.dat")
+        self._rpc_wallet_watch = coin_settings.get(
+            "watch_wallet_name", self._rpc_wallet
+        )
         self.rpc_wallet = make_rpc_func(
             self._rpcport, self._rpcauth, host=self._rpc_host, wallet=self._rpc_wallet
         )
+        if self._rpc_wallet_watch == self._rpc_wallet:
+            self.rpc_wallet_watch = self.rpc_wallet
+        else:
+            self.rpc_wallet_watch = make_rpc_func(
+                self._rpcport,
+                self._rpcauth,
+                host=self._rpc_host,
+                wallet=self._rpc_wallet_watch,
+            )
         self.blocks_confirmed = coin_settings["blocks_confirmed"]
         self.setConfTarget(coin_settings["conf_target"])
         self._use_segwit = coin_settings["use_segwit"]
@@ -278,6 +288,7 @@ class BTCInterface(Secp256k1Interface):
         self._log = self._sc.log if self._sc and self._sc.log else logging
         self._expect_seedid_hex = None
         self._altruistic = coin_settings.get("altruistic", True)
+        self._use_descriptors = coin_settings.get("use_descriptors", False)
 
     def open_rpc(self, wallet=None):
         return openrpc(self._rpcport, self._rpcauth, wallet=wallet, host=self._rpc_host)
@@ -301,11 +312,16 @@ class BTCInterface(Secp256k1Interface):
 
         # Wallet name is "" for some LTC and PART installs on older cores
         if self._rpc_wallet not in wallets and len(wallets) > 0:
-            self._log.debug(f"Changing {self.ticker()} wallet name.")
+            self._log.warning(f"Changing {self.ticker()} wallet name.")
             for wallet_name in wallets:
                 # Skip over other expected wallets
                 if wallet_name in ("mweb",):
                     continue
+
+                change_watchonly_wallet: bool = (
+                    self._rpc_wallet_watch == self._rpc_wallet
+                )
+
                 self._rpc_wallet = wallet_name
                 self._log.info(
                     f"Switched {self.ticker()} wallet name to {self._rpc_wallet}."
@@ -316,6 +332,8 @@ class BTCInterface(Secp256k1Interface):
                     host=self._rpc_host,
                     wallet=self._rpc_wallet,
                 )
+                if change_watchonly_wallet:
+                    self.rpc_wallet_watch = self.rpc_wallet
                 break
 
         return len(wallets)
@@ -360,9 +378,40 @@ class BTCInterface(Secp256k1Interface):
         raise ValueError(f"Block header not found at time: {time}")
 
     def initialiseWallet(self, key_bytes: bytes) -> None:
-        key_wif = self.encodeKey(key_bytes)
-        self.rpc_wallet("sethdseed", [True, key_wif])
+        assert len(key_bytes) == 32
         self._have_checked_seed = False
+        if self._use_descriptors:
+            self._log.info("Importing descriptors")
+            ek = ExtKeyPair()
+            ek.set_seed(key_bytes)
+            ek_encoded: str = self.encode_secret_extkey(ek.encode_v())
+            desc_external = descsum_create(f"wpkh({ek_encoded}/0h/0h/*h)")
+            desc_internal = descsum_create(f"wpkh({ek_encoded}/0h/1h/*h)")
+            rv = self.rpc_wallet(
+                "importdescriptors",
+                [
+                    [
+                        {"desc": desc_external, "timestamp": "now", "active": True},
+                        {
+                            "desc": desc_internal,
+                            "timestamp": "now",
+                            "active": True,
+                            "internal": True,
+                        },
+                    ],
+                ],
+            )
+
+            num_successful: int = 0
+            for entry in rv:
+                if entry.get("success", False) is True:
+                    num_successful += 1
+            if num_successful != 2:
+                self._log.error(f"Failed to import descriptors: {rv}.")
+                raise ValueError("Failed to import descriptors.")
+        else:
+            key_wif = self.encodeKey(key_bytes)
+            self.rpc_wallet("sethdseed", [True, key_wif])
 
     def getWalletInfo(self):
         rv = self.rpc_wallet("getwalletinfo")
@@ -372,7 +421,14 @@ class BTCInterface(Secp256k1Interface):
         return rv
 
     def getWalletRestoreHeight(self) -> int:
-        start_time = self.rpc_wallet("getwalletinfo")["keypoololdest"]
+        if self._use_descriptors:
+            descriptor = self.getActiveDescriptor()
+            if descriptor is None:
+                start_time = 0
+            else:
+                start_time = descriptor["timestamp"]
+        else:
+            start_time = self.rpc_wallet("getwalletinfo")["keypoololdest"]
 
         blockchaininfo = self.getBlockchainInfo()
         best_block = blockchaininfo["bestblockhash"]
@@ -392,6 +448,8 @@ class BTCInterface(Secp256k1Interface):
                 )
                 if block_header["time"] < start_time:
                     return block_header["height"]
+                if "previousblockhash" not in block_header:  # Genesis block
+                    return block_header["height"]
                 block_hash = block_header["previousblockhash"]
         finally:
             self.close_rpc(rpc_conn)
@@ -401,7 +459,32 @@ class BTCInterface(Secp256k1Interface):
         wi = self.rpc_wallet("getwalletinfo")
         return "Not found" if "hdseedid" not in wi else wi["hdseedid"]
 
+    def getActiveDescriptor(self):
+        descriptors = self.rpc_wallet("listdescriptors")["descriptors"]
+        for descriptor in descriptors:
+            if (
+                descriptor["desc"].startswith("wpkh")
+                and descriptor["active"] is True
+                and descriptor["internal"] is False
+            ):
+                return descriptor
+        return None
+
     def checkExpectedSeed(self, expect_seedid: str) -> bool:
+        if self._use_descriptors:
+            descriptor = self.getActiveDescriptor()
+            if descriptor is None:
+                self._log.debug("Could not find active descriptor.")
+                return False
+
+            end = descriptor["desc"].find("/")
+            if end < 10:
+                return False
+            extkey = descriptor["desc"][5:end]
+            extkey_data = b58decode(extkey)[4:-4]
+            extkey_data_hash: bytes = hash160(extkey_data)
+            return True if extkey_data_hash.hex() == expect_seedid else False
+
         wallet_seed_id = self.getWalletSeedID()
         self._expect_seedid_hex = expect_seedid
         self._have_checked_seed = True
@@ -426,6 +509,10 @@ class BTCInterface(Secp256k1Interface):
         addr_info = self.rpc_wallet("getaddressinfo", [address])
         if not or_watch_only:
             return addr_info["ismine"]
+
+        if self._use_descriptors:
+            addr_info = self.rpc_wallet_watch("getaddressinfo", [address])
+
         return addr_info["ismine"] or addr_info["iswatchonly"]
 
     def checkAddressMine(self, address: str) -> None:
@@ -493,6 +580,20 @@ class BTCInterface(Secp256k1Interface):
         pkh = hash160(pk)
         return segwit_addr.encode(bech32_prefix, version, pkh)
 
+    def encode_secret_extkey(self, ek_data: bytes) -> str:
+        assert len(ek_data) == 74
+        prefix = self.chainparams_network()["ext_secret_key_prefix"]
+        data: bytes = prefix.to_bytes(4, "big") + ek_data
+        checksum = sha256(sha256(data))
+        return b58encode(data + checksum[0:4])
+
+    def encode_public_extkey(self, ek_data: bytes) -> str:
+        assert len(ek_data) == 74
+        prefix = self.chainparams_network()["ext_public_key_prefix"]
+        data: bytes = prefix.to_bytes(4, "big") + ek_data
+        checksum = sha256(sha256(data))
+        return b58encode(data + checksum[0:4])
+
     def pkh_to_address(self, pkh: bytes) -> str:
         # pkh is ripemd160(sha256(pk))
         assert len(pkh) == 20
@@ -528,7 +629,12 @@ class BTCInterface(Secp256k1Interface):
         pk = self.getPubkey(key)
         return hash160(pk)
 
-    def getSeedHash(self, seed) -> bytes:
+    def getSeedHash(self, seed: bytes) -> bytes:
+        if self._use_descriptors:
+            ek = ExtKeyPair()
+            ek.set_seed(seed)
+            return hash160(ek.encode_p())
+
         return self.getAddressHashFromKey(seed)[::-1]
 
     def encodeKey(self, key_bytes: bytes) -> str:
@@ -628,11 +734,14 @@ class BTCInterface(Secp256k1Interface):
 
         tx.rehash()
         self._log.info(
-            "createSCLockRefundTx %s:\n    fee_rate, vsize, fee: %ld, %ld, %ld.",
-            i2h(tx.sha256),
-            tx_fee_rate,
-            vsize,
-            pay_fee,
+            "createSCLockRefundTx {}{}.".format(
+                self._log.id(i2b(tx.sha256)),
+                (
+                    ""
+                    if self._log.safe_logs
+                    else f":\n    fee_rate, vsize, fee: {tx_fee_rate}, {vsize}, {pay_fee}"
+                ),
+            )
         )
 
         return tx.serialize(), refund_script, tx.vout[0].nValue
@@ -683,11 +792,14 @@ class BTCInterface(Secp256k1Interface):
 
         tx.rehash()
         self._log.info(
-            "createSCLockRefundSpendTx %s:\n    fee_rate, vsize, fee: %ld, %ld, %ld.",
-            i2h(tx.sha256),
-            tx_fee_rate,
-            vsize,
-            pay_fee,
+            "createSCLockRefundSpendTx {}{}.".format(
+                self._log.id(i2b(tx.sha256)),
+                (
+                    ""
+                    if self._log.safe_logs
+                    else f":\n    fee_rate, vsize, fee: {tx_fee_rate}, {vsize}, {pay_fee}"
+                ),
+            )
         )
 
         return tx.serialize()
@@ -750,11 +862,14 @@ class BTCInterface(Secp256k1Interface):
 
         tx.rehash()
         self._log.info(
-            "createSCLockRefundSpendToFTx %s:\n    fee_rate, vsize, fee: %ld, %ld, %ld.",
-            i2h(tx.sha256),
-            tx_fee_rate,
-            vsize,
-            pay_fee,
+            "createSCLockRefundSpendToFTx {}{}.".format(
+                self._log.id(i2b(tx.sha256)),
+                (
+                    ""
+                    if self._log.safe_logs
+                    else f":\n    fee_rate, vsize, fee: {tx_fee_rate}, {vsize}, {pay_fee}"
+                ),
+            )
         )
 
         return tx.serialize()
@@ -797,11 +912,14 @@ class BTCInterface(Secp256k1Interface):
 
         tx.rehash()
         self._log.info(
-            "createSCLockSpendTx %s:\n    fee_rate, vsize, fee: %ld, %ld, %ld.",
-            i2h(tx.sha256),
-            tx_fee_rate,
-            vsize,
-            pay_fee,
+            "createSCLockSpendTx {}{}.".format(
+                self._log.id(i2b(tx.sha256)),
+                (
+                    ""
+                    if self._log.safe_logs
+                    else f":\n    fee_rate, vsize, fee: {tx_fee_rate}, {vsize}, {pay_fee}"
+                ),
+            )
         )
 
         return tx.serialize()
@@ -826,7 +944,7 @@ class BTCInterface(Secp256k1Interface):
 
         tx = self.loadTx(tx_bytes)
         txid = self.getTxid(tx)
-        self._log.info("Verifying lock tx: {}.".format(b2h(txid)))
+        self._log.info("Verifying lock tx: {}.".format(self._log.id(txid)))
 
         ensure(tx.nVersion == self.txVersion(), "Bad version")
         ensure(tx.nLockTime == 0, "Bad nLockTime")  # TODO match txns created by cores
@@ -914,7 +1032,7 @@ class BTCInterface(Secp256k1Interface):
 
         tx = self.loadTx(tx_bytes)
         txid = self.getTxid(tx)
-        self._log.info("Verifying lock refund tx: {}.".format(b2h(txid)))
+        self._log.info("Verifying lock refund tx: {}.".format(self._log.id(txid)))
 
         ensure(tx.nVersion == self.txVersion(), "Bad version")
         ensure(tx.nLockTime == 0, "nLockTime not 0")
@@ -953,7 +1071,7 @@ class BTCInterface(Secp256k1Interface):
         vsize = self.getTxVSize(tx, add_witness_bytes=witness_bytes)
         fee_rate_paid = fee_paid * 1000 // vsize
 
-        self._log.info(
+        self._log.info_s(
             "tx amount, vsize, feerate: %ld, %ld, %ld",
             locked_coin,
             vsize,
@@ -982,7 +1100,7 @@ class BTCInterface(Secp256k1Interface):
         #   Must have only one output sending lock refund tx value - fee to leader's address, TODO: follower shouldn't need to verify destination addr
         tx = self.loadTx(tx_bytes)
         txid = self.getTxid(tx)
-        self._log.info("Verifying lock refund spend tx: {}.".format(b2h(txid)))
+        self._log.info("Verifying lock refund spend tx: {}.".format(self._log.id(txid)))
 
         ensure(tx.nVersion == self.txVersion(), "Bad version")
         ensure(tx.nLockTime == 0, "nLockTime not 0")
@@ -1019,7 +1137,7 @@ class BTCInterface(Secp256k1Interface):
         vsize = self.getTxVSize(tx, add_witness_bytes=witness_bytes)
         fee_rate_paid = fee_paid * 1000 // vsize
 
-        self._log.info(
+        self._log.info_s(
             "tx amount, vsize, feerate: %ld, %ld, %ld", tx_value, vsize, fee_rate_paid
         )
 
@@ -1037,7 +1155,7 @@ class BTCInterface(Secp256k1Interface):
 
         tx = self.loadTx(tx_bytes)
         txid = self.getTxid(tx)
-        self._log.info("Verifying lock spend tx: {}.".format(b2h(txid)))
+        self._log.info("Verifying lock spend tx: {}.".format(self._log.id(txid)))
 
         ensure(tx.nVersion == self.txVersion(), "Bad version")
         ensure(tx.nLockTime == 0, "nLockTime not 0")
@@ -1075,7 +1193,7 @@ class BTCInterface(Secp256k1Interface):
         vsize = self.getTxVSize(tx, add_witness_bytes=witness_bytes)
         fee_rate_paid = fee_paid * 1000 // vsize
 
-        self._log.info(
+        self._log.info_s(
             "tx amount, vsize, feerate: %ld, %ld, %ld",
             tx.vout[0].nValue,
             vsize,
@@ -1385,7 +1503,7 @@ class BTCInterface(Secp256k1Interface):
         witness_bytes = 109
         vsize = self.getTxVSize(tx, add_witness_bytes=witness_bytes)
         pay_fee = round(fee_rate * vsize / 1000)
-        self._log.info(
+        self._log.info_s(
             f"BLockSpendTx fee_rate, vsize, fee: {fee_rate}, {vsize}, {pay_fee}."
         )
         return pay_fee
@@ -1403,7 +1521,9 @@ class BTCInterface(Secp256k1Interface):
         lock_tx_vout=None,
     ) -> bytes:
         self._log.info(
-            "spendBLockTx: {} {}\n".format(chain_b_lock_txid.hex(), lock_tx_vout)
+            "spendBLockTx: {} {}\n".format(
+                self._log.id(chain_b_lock_txid), lock_tx_vout
+            )
         )
         locked_n = lock_tx_vout
 
@@ -1411,7 +1531,7 @@ class BTCInterface(Secp256k1Interface):
         script_pk = self.getPkDest(Kbs)
 
         if locked_n is None:
-            wtx = self.rpc_wallet(
+            wtx = self.rpc_wallet_watch(
                 "gettransaction",
                 [
                     chain_b_lock_txid.hex(),
@@ -1448,10 +1568,23 @@ class BTCInterface(Secp256k1Interface):
 
         return bytes.fromhex(self.publishTx(b_lock_spend_tx))
 
-    def importWatchOnlyAddress(self, address: str, label: str):
+    def importWatchOnlyAddress(self, address: str, label: str) -> None:
+        if self._use_descriptors:
+            desc_watch = descsum_create(f"addr({address})")
+            rv = self.rpc_wallet_watch(
+                "importdescriptors",
+                [
+                    [
+                        {"desc": desc_watch, "timestamp": "now", "active": False},
+                    ],
+                ],
+            )
+            ensure(rv[0]["success"] is True, "importdescriptors failed for watchonly")
+            return
+
         self.rpc_wallet("importaddress", [address, label, False])
 
-    def isWatchOnlyAddress(self, address: str):
+    def isWatchOnlyAddress(self, address: str) -> bool:
         addr_info = self.rpc_wallet("getaddressinfo", [address])
         return addr_info["iswatchonly"]
 
@@ -1471,7 +1604,9 @@ class BTCInterface(Secp256k1Interface):
         # Add watchonly address and rescan if required
         if not self.isAddressMine(dest_address, or_watch_only=True):
             self.importWatchOnlyAddress(dest_address, "bid")
-            self._log.info("Imported watch-only addr: {}".format(dest_address))
+            self._log.info(
+                "Imported watch-only addr: {}".format(self._log.addr(dest_address))
+            )
             self._log.info(
                 "Rescanning {} chain from height: {}".format(
                     self.coin_name(), rescan_from
@@ -1481,7 +1616,7 @@ class BTCInterface(Secp256k1Interface):
 
         return_txid = True if txid is None else False
         if txid is None:
-            txns = self.rpc_wallet(
+            txns = self.rpc_wallet_watch(
                 "listunspent",
                 [
                     0,
@@ -1502,7 +1637,7 @@ class BTCInterface(Secp256k1Interface):
 
         try:
             # set `include_watchonly` explicitly to `True` to get transactions for watchonly addresses also in BCH
-            tx = self.rpc_wallet("gettransaction", [txid.hex(), True])
+            tx = self.rpc_wallet_watch("gettransaction", [txid.hex(), True])
 
             block_height = 0
             if "blockhash" in tx:
